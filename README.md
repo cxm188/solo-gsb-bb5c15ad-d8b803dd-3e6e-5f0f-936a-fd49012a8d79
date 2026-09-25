@@ -54,7 +54,17 @@ manifest（或直接上传 **CycloneDX JSON** SBOM），系统会：
     （并行路径、汇合路径与依赖环都纳入计算，不只处理当前最短路径）；
     网页展示原最短路径、建议断边（标出落在原最短路径上的边）与断边后是否仍可达。
     审计或冲突/告警不存在时返回明确错误（404）；分析为纯只读操作，
-    **不改动原审计结果与复核标记**，原生 manifest 与 CycloneDX 审计均可使用。
+    **不改动原审计结果与复核标记**，原生 manifest 与 CycloneDX 审计均可使用；
+13. **审计复现包（离线转交与核验）** —— 在网页第 2 节选择一条历史审计即可下载
+    **复现包**（或调用 `GET /api/audits/{id}/repro`）：包内含格式版本、审计名称、
+    原始 manifest、**未附着实时复核标记的保存结果**，以及后两者按稳定键序列化
+    （键排序的紧凑 JSON）计算的 **SHA-256 摘要**，可作为单个 JSON 文件离线转交。
+    收到包的一方在网页第 2 节上传（或 `POST /api/audits/repro/verify`）即可核验：
+    服务端先重算两项摘要与包内记录比对，再用包内 manifest 调用同一分析器重新分析，
+    剔除审计 id、创建时间等运行元数据后逐项比对**节点、依赖边、冲突严重程度与最短路径**，
+    发现不一致时指出**首个不一致字段**；只有摘要与复算结果都一致才判通过。
+    核验为纯只读操作，**不创建审计、不改动复核标记**；包格式错误
+    （版本不符、字段缺失、摘要非 64 位十六进制等）返回明确的 422 提示。
 
 ## 快速开始（Docker Compose，一键启动，推荐）
 
@@ -71,7 +81,7 @@ docker compose up --build          # 前台启动（加 -d 可后台运行）
 
 | 地址 | 说明 |
 | --- | --- |
-| <http://localhost:8000/> | 网页界面（已自动载入示例 manifest，可一键切换 CycloneDX 示例；第 2 节可对比两次历史审计，第 3 节可做根包退役预演，第 4 节可做单包许可证替换预演，第 5 节可做未解析依赖补边预演，第 7 节可对单条冲突做最少断边分析） |
+| <http://localhost:8000/> | 网页界面（已自动载入示例 manifest，可一键切换 CycloneDX 示例；第 2 节可对比两次历史审计、下载/上传核验审计复现包，第 3 节可做根包退役预演，第 4 节可做单包许可证替换预演，第 5 节可做未解析依赖补边预演，第 7 节可对单条冲突做最少断边分析） |
 | <http://localhost:8000/docs> | Swagger 风格交互式 JSON API 文档 |
 | <http://localhost:8000/redoc> | ReDoc API 文档 |
 | <http://localhost:8000/api/matrix> | 许可证兼容矩阵（机器可读） |
@@ -216,6 +226,9 @@ $ curl -s -X POST http://localhost:8000/api/audit -H "Content-Type: application/
 | GET | `/api/audits/{id}` | 获取审计结果；`?package=xxx` 按包筛选 |
 | GET | `/api/audits/{id}?download=true&package=xxx` | 导出（筛选后的）JSON 文件 |
 | GET | `/api/audits/compare/{base_id}/{target_id}` | **两次审计对比**（只读，不写入） |
+| GET | `/api/audits/{id}/repro` | **导出审计复现包**（原始 manifest + 保存结果 + 两者 SHA-256 摘要，下载为 JSON 文件） |
+| POST | `/api/audits/repro/verify` | **核验审计复现包**（请求体即复现包 JSON；只读，不写入） |
+| POST | `/api/audits/repro/verify/upload` | 上传复现包文件核验（multipart；只读，不写入） |
 | GET | `/api/audits/{id}/retire?retire=a@1&retire=b@2` | **根包退役预演**（只读；不带参数返回根包列表） |
 | GET | `/api/audits/{id}/relicense?package=a@1&license=MIT` | **单包许可证替换预演**（只读；不带参数返回可选包与候选许可证列表） |
 | GET | `/api/audits/{id}/edgefix?source=a@1&reference=x@2&target=x@1` | **未解析依赖补边预演**（只读；不带参数返回源包仍存在的未解析引用与目标包列表） |
@@ -273,6 +286,100 @@ HTTP/1.1 400 Bad Request
 网页端在首页第 2 节「历史审计 · 两次对比」选择两条记录后点击对比即可：
 结果按新增 / 消失 / 变化分组，变化项会用 `硬冲突 → 告警` 这类徽标展示严重程度翻转，
 并同时渲染双方的最短依赖路径（红色=基准，绿色=目标），折叠区可查看全部节点配对明细。
+
+### 审计复现包接口
+
+复现包把一次历史审计的**原始 manifest** 与**未附着实时复核标记的保存结果**打包成
+可离线转交的单一 JSON，收到包的一方无需访问原数据库即可核验内容是否完整、可复现。
+
+**导出**（下载为 `audit-{id}-repro.json`）：
+
+```bash
+curl -OJ http://localhost:8000/api/audits/1/repro
+```
+
+包结构：
+
+```json
+{
+  "format": "audit-repro/1",
+  "audit_name": "billing-platform-demo",
+  "digests": {
+    "manifest_sha256": "…64 位十六进制…",
+    "result_sha256": "…64 位十六进制…"
+  },
+  "manifest": { "…": "原始 manifest（原生或 CycloneDX）" },
+  "result": { "…": "保存的审计结果（含 audit_id / created_at，无复核标记字段）" }
+}
+```
+
+两个摘要都是对**稳定键序列化**（`json.dumps(sort_keys=True)` 的紧凑 JSON）计算的
+SHA-256，与键顺序、空白无关，转交途中被重新格式化也不影响核验。
+
+**核验**（请求体即复现包 JSON，或用 multipart 上传文件）：
+
+```bash
+# JSON 请求体
+curl -X POST http://localhost:8000/api/audits/repro/verify \
+  -H "Content-Type: application/json" \
+  -d @audit-1-repro.json
+
+# 或上传文件
+curl -F "file=@audit-1-repro.json" http://localhost:8000/api/audits/repro/verify/upload
+```
+
+核验按固定顺序执行，全部通过才判 `passed=true`：
+
+1. **结构校验** —— 格式版本（`audit-repro/1`）、`audit_name` 非空、`digests` 两个
+   摘要均为 64 位小写十六进制、`manifest` / `result` 为 JSON 对象；
+   任一不满足返回 `422` 并给出明确提示；
+2. **摘要重算** —— 对包内 `manifest` / `result` 按稳定键序列化重算 SHA-256，
+   与包内 `digests` 逐一比对；
+3. **复算比对** —— 用包内 `manifest` 调用同一分析器重新分析，剔除 `audit_id`、
+   `created_at` 等运行元数据（以及响应层才附着的复核标记字段）后，按
+   节点 → 依赖边 → 冲突（严重程度、最短路径等）→ 其余小节 的顺序逐项深度比对。
+
+返回内容（节选）：
+
+```json
+{
+  "kind": "audit-repro-verification",
+  "read_only": true,
+  "passed": true,
+  "format": "audit-repro/1",
+  "audit_name": "billing-platform-demo",
+  "checks": [
+    { "key": "format", "label": "格式版本", "ok": true, "detail": "audit-repro/1" },
+    { "key": "manifest_digest", "label": "manifest 摘要", "ok": true,
+      "expected": "4b8f…", "actual": "4b8f…", "detail": "包内摘要与重算一致（4b8f…）" },
+    { "key": "result_digest", "label": "保存结果摘要", "ok": true, "…": "…" },
+    { "key": "recompute", "label": "复算比对", "ok": true,
+      "detail": "复算结果与保存结果逐项一致（节点 15、依赖边 15、冲突/告警 13）" }
+  ],
+  "first_mismatch": null,
+  "recomputed_summary": { "packages": 15, "edges": 15, "…": "…" },
+  "message": "核验通过：两项 SHA-256 摘要一致，且复算结果与保存结果逐项一致。"
+}
+```
+
+核验未通过时 `passed=false`，`checks` 中标出失败项；若复算结果与包内保存结果不一致，
+`first_mismatch` 指出**首个不一致字段**（`path` 如 `conflicts[0].severity`，
+并附 `expected`=包内保存值、`actual`=复算值）。注意摘要覆盖包含 `created_at` 在内的
+完整保存结果，因此篡改运行元数据会被摘要检查发现，即使它不参与逐项比对。
+
+核验是**只读**操作，不创建审计、不改动复核标记、不访问数据库（包外信息一律不查）。
+格式错误返回明确提示：
+
+```bash
+$ curl -i -X POST http://localhost:8000/api/audits/repro/verify \
+    -H "Content-Type: application/json" -d '{"format": "audit-repro/0"}'
+HTTP/1.1 422 Unprocessable Entity
+{"detail":"复现包格式版本不支持：'audit-repro/0'（本服务期望 'audit-repro/1'）。"}
+```
+
+网页端在第 2 节「历史审计 · 两次对比」下方的「复现包 · 离线转交与核验」选择审计后
+即可下载复现包；上传复现包文件后页面展示通过/未通过徽标、逐项检查结果与
+首个不一致字段（若有），全程只读。
 
 ### 跨审计复核标记接口
 
@@ -626,10 +733,11 @@ CycloneDX 导入的审计结果结构相同，另带 `"source_format": "cycloned
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由（JSON API + 网页，含对比/复核/预演/最少断边接口）
+│   ├── main.py        # FastAPI 路由（JSON API + 网页，含对比/复核/预演/最少断边/复现包接口）
 │   ├── analyzer.py    # manifest 解析、节点规范化、传递约束、最短路径（自动路由 CycloneDX）
 │   ├── cyclonedx.py   # CycloneDX JSON 导入：bom-ref 映射节点、ref/dependsOn 还原依赖边
 │   ├── compare.py     # 两次审计对比：节点/冲突配对与变化检测（纯只读）
+│   ├── repro.py       # 审计复现包：稳定键序列化摘要导出、复算逐项比对核验（纯只读）
 │   ├── retire.py      # 根包退役预演：从剩余根包重算可达集合（纯只读）
 │   ├── relicense.py   # 单包许可证替换预演：替换一个节点许可证后沿原图重算并配对（纯只读）
 │   ├── edgefix.py     # 未解析依赖补边预演：补一条边并移除所选未解析项后重算并配对（纯只读）
@@ -640,7 +748,7 @@ CycloneDX 导入的审计结果结构相同，另带 `"source_format": "cycloned
 ├── static/
 │   ├── index.html     # 单文件网页（无外部 CDN 依赖）
 │   └── examples/      # sample-manifest.json 与 sample-cyclonedx.json 两个内置示例
-├── tests/             # 轻量自测：python -m tests.test_analyzer / test_compare / test_reviews / test_cyclonedx / test_retire / test_relicense / test_edgefix / test_edgecut
+├── tests/             # 轻量自测：python -m tests.test_analyzer / test_compare / test_reviews / test_cyclonedx / test_retire / test_relicense / test_edgefix / test_edgecut / test_repro
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

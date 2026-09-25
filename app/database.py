@@ -190,6 +190,22 @@ def get_audit(manifest_id: int) -> Optional[Dict[str, Any]]:
     return json.loads(row["result_json"])
 
 
+def get_audit_bundle(manifest_id: int) -> Optional[Dict[str, Any]]:
+    """取原始 manifest 与保存结果（未附着复核标记的 result_json），用于导出复现包。"""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT name, manifest_json, result_json FROM manifests WHERE id = ?",
+            (manifest_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "name": row["name"],
+        "manifest": json.loads(row["manifest_json"]),
+        "result": json.loads(row["result_json"]),
+    }
+
+
 def audit_exists(manifest_id: int) -> bool:
     with connect() as conn:
         row = conn.execute(

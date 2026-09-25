@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Body, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -20,6 +20,7 @@ from . import (
     edgefix as edgefix_mod,
     licenses,
     relicense as relicense_mod,
+    repro as repro_mod,
     retire as retire_mod,
     reviews as reviews_mod,
 )
@@ -135,6 +136,57 @@ def compare_audits(base_id: int, target_id: int) -> Dict[str, Any]:
     base_result = database.get_audit(base_id)
     target_result = database.get_audit(target_id)
     return compare_mod.compare_audits(base_result, target_result)
+
+
+@app.get(
+    "/api/audits/{audit_id}/repro",
+    tags=["audit"],
+    summary="导出审计复现包（原始 manifest + 未附着复核标记的保存结果 + 两者 SHA-256 摘要，可离线转交核验）",
+)
+def export_repro(audit_id: int) -> Any:
+    bundle = database.get_audit_bundle(audit_id)
+    if bundle is None:
+        raise HTTPException(status_code=404, detail="审计记录不存在：%s" % audit_id)
+    package = repro_mod.build_package(bundle["name"], bundle["manifest"], bundle["result"])
+    return JSONResponse(
+        package,
+        headers={
+            "Content-Disposition": 'attachment; filename="audit-%s-repro.json"' % audit_id
+        },
+    )
+
+
+@app.post(
+    "/api/audits/repro/verify",
+    tags=["audit"],
+    summary="核验审计复现包（请求体即复现包 JSON；只读，不写入审计）",
+)
+def verify_repro(package: Any = Body(...)) -> Dict[str, Any]:
+    try:
+        return repro_mod.verify_package(package)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post(
+    "/api/audits/repro/verify/upload",
+    tags=["audit"],
+    summary="上传复现包文件核验（multipart；只读，不写入审计）",
+)
+async def verify_repro_upload(
+    file: UploadFile = File(..., description="复现包 JSON 文件"),
+) -> Dict[str, Any]:
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=422, detail="上传文件为空。")
+    try:
+        package = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="无法解析 JSON 文件：%s" % exc)
+    try:
+        return repro_mod.verify_package(package)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
 
 @app.get(

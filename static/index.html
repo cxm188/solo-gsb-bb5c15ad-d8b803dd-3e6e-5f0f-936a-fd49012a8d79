@@ -179,6 +179,25 @@
       许可证冲突/告警按「祖先节点 → 被依赖节点」配对，新增/消失/状态变化都会附上双方的最短依赖路径。
     </div>
     <div id="compare-result" class="hidden-block" style="margin-top:18px;"></div>
+    <hr style="border:none;border-top:1px dashed var(--line);margin:18px 0;">
+    <h3 style="margin:0 0 10px;font-size:14px;">复现包 · 离线转交与核验 <span class="pill">只读 · 不写入审计</span></h3>
+    <div id="repro-alert" class="alert"></div>
+    <div class="row" style="margin-top:0;">
+      <select id="repro-audit"></select>
+      <button class="secondary" id="btn-repro-download">⬇ 下载复现包</button>
+      <label class="secondary" style="border:1px solid var(--line);border-radius:7px;padding:9px 16px;cursor:pointer;background:#eef2f8;color:var(--brand-dark);font-weight:600;font-size:13px;">
+        上传复现包核验
+        <input id="repro-file" type="file" accept=".json,application/json" style="display:none">
+      </label>
+    </div>
+    <div class="hint" style="margin-top:8px;">
+      复现包含格式版本、审计名称、原始 manifest、<b>未附着复核标记的保存结果</b>及后两者按稳定键序列化计算的
+      SHA-256 摘要，可作为单个 JSON 文件离线转交。上传核验时服务端先重算两项摘要比对，
+      再用包内 manifest 重新分析，剔除审计 id、时间等运行元数据后逐项比对节点、依赖边、冲突严重程度与最短路径，
+      发现不一致会指出<b>首个不一致字段</b>；只有摘要与复算结果都一致才判通过。
+      核验为只读操作，不会创建审计或改动复核标记；包格式错误会返回明确提示。
+    </div>
+    <div id="repro-result" class="hidden-block" style="margin-top:14px;"></div>
   </section>
 
   <section class="card">
@@ -694,7 +713,7 @@ async function loadAuditList() {
     showCompareAlert(e.message);
     return [];
   }
-  const prev = { base: $("cmp-base").value, target: $("cmp-target").value, retire: $("retire-audit").value, relicense: $("relicense-audit").value, edgefix: $("edgefix-audit").value };
+  const prev = { base: $("cmp-base").value, target: $("cmp-target").value, retire: $("retire-audit").value, relicense: $("relicense-audit").value, edgefix: $("edgefix-audit").value, repro: $("repro-audit").value };
   const fill = (sel, selected) => {
     sel.innerHTML = "";
     const placeholder = document.createElement("option");
@@ -714,6 +733,7 @@ async function loadAuditList() {
   fill($("retire-audit"), prev.retire || (items.length ? String(items[0].id) : ""));
   fill($("relicense-audit"), prev.relicense || (items.length ? String(items[0].id) : ""));
   fill($("edgefix-audit"), prev.edgefix || (items.length ? String(items[0].id) : ""));
+  fill($("repro-audit"), prev.repro || (items.length ? String(items[0].id) : ""));
   // 首次加载默认选最新两条（列表为倒序：items[0] 最新）
   if (!prev.base && items.length) $("cmp-base").value = String(items[0].id);
   // 退役预演的根包列表随审计选择联动加载
@@ -882,6 +902,87 @@ $("btn-compare").addEventListener("click", async () => {
 });
 
 $("btn-refresh-audits").addEventListener("click", loadAuditList);
+
+// --- 审计复现包：下载与上传核验（只读） ----------------------------------------
+
+function showReproAlert(msg) {
+  const el = $("repro-alert");
+  el.textContent = msg;
+  el.className = "alert error show";
+}
+function clearReproAlert() { $("repro-alert").className = "alert"; }
+
+$("btn-repro-download").addEventListener("click", () => {
+  clearReproAlert();
+  const aid = $("repro-audit").value;
+  if (!aid) { showReproAlert("请先选择一条审计记录。"); return; }
+  window.location.href = "/api/audits/" + aid + "/repro";
+});
+
+$("repro-file").addEventListener("change", async () => {
+  const file = $("repro-file").files[0];
+  if (!file) return;
+  clearReproAlert();
+  $("repro-result").className = "hidden-block";
+  try {
+    const text = await file.text();
+    // 原文上传，格式问题由服务端返回明确提示
+    const resp = await fetch("/api/audits/repro/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: text,
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showReproAlert(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+      return;
+    }
+    renderReproResult(data);
+  } catch (e) {
+    showReproAlert("核验请求失败：" + e.message);
+  } finally {
+    $("repro-file").value = "";  // 允许重复选择同一文件
+  }
+});
+
+function renderReproResult(data) {
+  let html = data.passed
+    ? '<p style="margin:0 0 8px;"><span class="badge clean">✓ 核验通过</span></p>'
+    : '<p style="margin:0 0 8px;"><span class="badge conflict">✗ 核验未通过</span></p>';
+  html += '<div class="meta-line">复现包 <span class="mono"><b>' + esc(data.audit_name) + "</b></span>" +
+    " · 格式 <span class='mono'>" + esc(data.format) + "</span></div>";
+
+  html += '<div class="cut-list">' + (data.checks || []).map((c) =>
+    '<div class="cut-edge-item' + (c.ok ? " alternate" : "") + '">' +
+    (c.ok ? '<span class="badge clean">✓</span>' : '<span class="badge conflict">✗</span>') +
+    "<span><b>" + esc(c.label) + "</b>" +
+    (c.detail ? ' <span class="hint">' + esc(c.detail) + "</span>" : "") + "</span></div>"
+  ).join("") + "</div>";
+
+  if (data.first_mismatch) {
+    const m = data.first_mismatch;
+    html += '<div class="conflict error" style="margin-top:10px;"><div class="head">' +
+      '<span class="badge conflict">首个不一致字段</span>' +
+      '<span class="mono"><b>' + esc(m.path) + "</b></span>" +
+      (m.section_label ? '<span class="pill">' + esc(m.section_label) + "</span>" : "") + "</div>" +
+      '<div class="reason">' + esc(m.message) + "</div>" +
+      '<div class="path">保存结果：' + esc(JSON.stringify(m.expected)) +
+      "<br>复算结果：" + esc(JSON.stringify(m.actual)) + "</div></div>";
+  }
+
+  const s = data.recomputed_summary;
+  if (data.passed && s) {
+    html += '<p class="hint" style="margin-top:8px;">复算概况：节点 ' + s.packages +
+      " · 依赖边 " + s.edges + " · 硬冲突 " + s.conflicts + " · 告警 " + s.license_warnings +
+      " · 未解析 " + s.unresolved + "。</p>";
+  }
+  html += '<p class="hint" style="margin-top:8px;">' + esc(data.message) +
+    " 核验为只读操作，不创建审计、不改动复核标记。</p>";
+
+  const box = $("repro-result");
+  box.innerHTML = html;
+  box.className = "";
+}
 
 // --- 根包退役预演 -----------------------------------------------------------
 
