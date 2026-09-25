@@ -165,7 +165,7 @@
   </section>
 
   <section class="card">
-    <h2>2. 历史审计 · 两次对比</h2>
+    <h2>2. 历史审计 · 两次对比 · 复现包核验</h2>
     <div id="compare-alert" class="alert"></div>
     <div class="row">
       <select id="cmp-base"></select>
@@ -179,6 +179,26 @@
       许可证冲突/告警按「祖先节点 → 被依赖节点」配对，新增/消失/状态变化都会附上双方的最短依赖路径。
     </div>
     <div id="compare-result" class="hidden-block" style="margin-top:18px;"></div>
+
+    <div class="row" style="margin-top:16px;border-top:1px dashed var(--line);padding-top:14px;">
+      <select id="repro-audit"></select>
+      <button class="secondary" id="btn-repro-download">⬇ 下载复现包</button>
+      <label class="secondary" style="border:1px solid var(--line);border-radius:7px;padding:9px 16px;cursor:pointer;background:#eef2f8;color:var(--brand-dark);font-weight:600;font-size:13px;">
+        选择复现包文件
+        <input id="repro-file" type="file" accept=".json,application/json" style="display:none">
+      </label>
+      <button id="btn-repro-verify" disabled>上传核验</button>
+      <span class="hint" id="repro-file-name"></span>
+    </div>
+    <div id="repro-alert" class="alert" style="margin-top:10px;"></div>
+    <div class="hint" style="margin-top:8px;">
+      复现包（格式 <span class="mono">audit-repro/v1</span>）包含原始 manifest、保存的审计结果（未附着复核标记）
+      及两者的 SHA-256 摘要，可离线转交。核验为只读操作：按稳定键序列化重算两处摘要，
+      并用包内 manifest 重新调用分析器，剔除审计 ID、时间等运行元数据后逐项比对
+      节点、依赖边、冲突严重程度与最短路径——只有摘要与复算结果都一致才判通过，
+      否则指出首个不一致字段。核验不会创建审计或改动复核标记。
+    </div>
+    <div id="repro-result" class="hidden-block" style="margin-top:14px;"></div>
   </section>
 
   <section class="card">
@@ -694,7 +714,7 @@ async function loadAuditList() {
     showCompareAlert(e.message);
     return [];
   }
-  const prev = { base: $("cmp-base").value, target: $("cmp-target").value, retire: $("retire-audit").value, relicense: $("relicense-audit").value, edgefix: $("edgefix-audit").value };
+  const prev = { base: $("cmp-base").value, target: $("cmp-target").value, retire: $("retire-audit").value, relicense: $("relicense-audit").value, edgefix: $("edgefix-audit").value, repro: $("repro-audit").value };
   const fill = (sel, selected) => {
     sel.innerHTML = "";
     const placeholder = document.createElement("option");
@@ -714,6 +734,7 @@ async function loadAuditList() {
   fill($("retire-audit"), prev.retire || (items.length ? String(items[0].id) : ""));
   fill($("relicense-audit"), prev.relicense || (items.length ? String(items[0].id) : ""));
   fill($("edgefix-audit"), prev.edgefix || (items.length ? String(items[0].id) : ""));
+  fill($("repro-audit"), prev.repro || (items.length ? String(items[0].id) : ""));
   // 首次加载默认选最新两条（列表为倒序：items[0] 最新）
   if (!prev.base && items.length) $("cmp-base").value = String(items[0].id);
   // 退役预演的根包列表随审计选择联动加载
@@ -882,6 +903,97 @@ $("btn-compare").addEventListener("click", async () => {
 });
 
 $("btn-refresh-audits").addEventListener("click", loadAuditList);
+
+// --- 审计复现包：下载与上传核验（只读） -----------------------------------------
+
+let reproFile = null;  // 待核验的复现包文件
+
+function showReproAlert(msg) {
+  const el = $("repro-alert");
+  el.textContent = msg;
+  el.className = "alert error show";
+}
+function clearReproAlert() { $("repro-alert").className = "alert"; }
+
+$("btn-repro-download").addEventListener("click", () => {
+  clearReproAlert();
+  const aid = $("repro-audit").value;
+  if (!aid) { showReproAlert("请先选择一条审计记录再下载复现包。"); return; }
+  window.location.href = "/api/audits/" + aid + "/repro";
+});
+
+$("repro-file").addEventListener("change", () => {
+  reproFile = $("repro-file").files[0] || null;
+  $("repro-file-name").textContent = reproFile ? "已选择：" + reproFile.name : "";
+  $("btn-repro-verify").disabled = !reproFile;
+  clearReproAlert();
+});
+
+function renderReproVerify(data) {
+  const checkRow = (c) => {
+    const badge = c.ok
+      ? '<span class="badge clean">一致</span>'
+      : '<span class="badge conflict">不一致</span>';
+    let detail = "";
+    if (c.id === "recompute" && !c.ok) {
+      detail = '<div class="hint" style="margin-top:4px;">' +
+        (c.error ? esc(c.error)
+                : "首个不一致字段：<span class='mono'><b>" + esc(c.field || "") + "</b></span>" +
+                  "（保存值 <span class='mono'>" + esc(JSON.stringify(c.stored)) + "</span>，" +
+                  "复算值 <span class='mono'>" + esc(JSON.stringify(c.recomputed)) + "</span>）") +
+        "</div>";
+    }
+    return '<div style="display:flex;gap:8px;align-items:baseline;margin:6px 0;flex-wrap:wrap;">' +
+      badge + "<span>" + esc(c.label) + "</span>" + detail + "</div>";
+  };
+
+  let html = '<div class="meta-line">' +
+    (data.ok ? '<span class="badge clean">✔ 核验通过</span>' : '<span class="badge conflict">✘ 核验未通过</span>') +
+    ' 复现包 <span class="mono"><b>' + esc(data.name || "") + "</b></span>" +
+    (data.source_audit_id != null ? ' <span class="pill">来源审计 #' + esc(data.source_audit_id) + "</span>" : "") +
+    (data.exported_at ? ' <span class="muted">导出于 ' + esc(data.exported_at) + "</span>" : "") +
+    "</div>";
+
+  html += '<div style="margin:10px 0;">' + (data.checks || []).map(checkRow).join("") + "</div>";
+
+  const r = data.recomputed || {};
+  const num = (v) => (v === null || v === undefined ? "—" : v);
+  html += '<div class="stats">' +
+    '<div class="stat"><div class="num">' + num(r.packages) + '</div><div class="label">复算节点</div></div>' +
+    '<div class="stat"><div class="num">' + num(r.edges) + '</div><div class="label">复算依赖边</div></div>' +
+    '<div class="stat"><div class="num" style="color:var(--err)">' + num(r.conflicts) + '</div><div class="label">复算硬冲突</div></div>' +
+    '<div class="stat"><div class="num" style="color:var(--warn)">' + num(r.license_warnings) + '</div><div class="label">复算告警</div></div>' +
+    "</div>";
+
+  html += '<div class="hint" style="margin-top:10px;">' + esc(data.message || "") +
+    " 核验为只读操作，未创建审计、未改动复核标记。</div>";
+
+  const box = $("repro-result");
+  box.innerHTML = html;
+  box.className = "";
+}
+
+$("btn-repro-verify").addEventListener("click", async () => {
+  clearReproAlert();
+  if (!reproFile) { showReproAlert("请先选择要核验的复现包文件。"); return; }
+  $("btn-repro-verify").disabled = true;
+  try {
+    const form = new FormData();
+    form.append("file", reproFile);
+    const resp = await fetch("/api/repro/verify/upload", { method: "POST", body: form });
+    const data = await resp.json();
+    if (!resp.ok) {
+      $("repro-result").className = "hidden-block";
+      showReproAlert(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+      return;
+    }
+    renderReproVerify(data);
+  } catch (e) {
+    showReproAlert("复现包核验请求失败：" + e.message);
+  } finally {
+    $("btn-repro-verify").disabled = !reproFile;
+  }
+});
 
 // --- 根包退役预演 -----------------------------------------------------------
 

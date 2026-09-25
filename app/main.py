@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, Body, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -20,6 +20,7 @@ from . import (
     edgefix as edgefix_mod,
     licenses,
     relicense as relicense_mod,
+    repro as repro_mod,
     retire as retire_mod,
     reviews as reviews_mod,
 )
@@ -276,6 +277,61 @@ def delete_audit(audit_id: int) -> Dict[str, Any]:
     if not database.delete_audit(audit_id):
         raise HTTPException(status_code=404, detail="审计记录不存在：%s" % audit_id)
     return {"deleted": audit_id}
+
+
+# --- 审计复现包（导出 / 离线核验，核验只读） ------------------------------------
+
+
+@app.get(
+    "/api/audits/{audit_id}/repro",
+    tags=["repro"],
+    summary="导出审计复现包（原始 manifest + 保存结果 + 两者 SHA-256 摘要，可离线转交）",
+)
+def export_repro_bundle(audit_id: int) -> Any:
+    raw = database.get_audit_raw(audit_id)
+    if raw is None:
+        raise HTTPException(status_code=404, detail="审计记录不存在：%s" % audit_id)
+    bundle = repro_mod.build_bundle(audit_id, raw["name"], raw["manifest"], raw["result"])
+    return JSONResponse(
+        bundle,
+        headers={
+            "Content-Disposition": 'attachment; filename="audit-%d-repro.json"' % audit_id
+        },
+    )
+
+
+def _verify_repro_bundle(bundle: Any) -> Dict[str, Any]:
+    try:
+        return repro_mod.verify_bundle(bundle)
+    except repro_mod.BundleFormatError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
+@app.post(
+    "/api/repro/verify",
+    tags=["repro"],
+    summary="核验审计复现包（JSON 请求体，只读：重算摘要 + 分析器复算逐项比对）",
+)
+def verify_repro_bundle(bundle: Any = Body(..., description="复现包 JSON 对象")) -> Dict[str, Any]:
+    return _verify_repro_bundle(bundle)
+
+
+@app.post(
+    "/api/repro/verify/upload",
+    tags=["repro"],
+    summary="上传复现包文件核验（只读，不创建审计、不改动复核标记）",
+)
+async def verify_repro_bundle_upload(
+    file: UploadFile = File(..., description="复现包 JSON 文件（audit-*-repro.json）"),
+) -> Dict[str, Any]:
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=422, detail="上传文件为空。")
+    try:
+        bundle = json.loads(raw.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="无法解析 JSON 文件：%s" % exc)
+    return _verify_repro_bundle(bundle)
 
 
 # --- 跨审计复核标记 -----------------------------------------------------------
